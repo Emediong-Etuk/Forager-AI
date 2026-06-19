@@ -27,6 +27,25 @@ interface ResearchRequest {
   projectName: string;
 }
 
+const CRYPTO_KEYWORDS = [
+  'token', 'blockchain', 'deFi', 'nft', 'cryptocurrency', 'crypto',
+  'coin', 'smart contract', 'web3', 'dao', 'dex', 'yield', 'staking',
+  'protocol', 'layer 1', 'layer 2', 'l1', 'l2', 'swap', 'liquidity',
+  'governance', 'wallet', 'defi', 'meme coin', 'altcoin', 'btc', 'eth',
+  'satoshi', 'vitalik', 'whitepaper', 'presale', 'ico', 'airdrop',
+  'mainnet', 'testnet', 'consensus', 'validator', 'nodes'
+];
+
+const EXCLUDED_KEYWORDS = [
+  'football', 'soccer', 'player', 'club', 'team', 'match',
+  'basketball', 'tennis', 'athlete', 'sport', 'coach', 'striker',
+  'goalkeeper', 'midfielder', 'defender', 'world cup', 'champions league',
+  'premier league', 'la liga', 'serie a', 'league 1', 'bundesliga',
+  'country', 'nation', 'president', 'politician', 'actor', 'actress',
+  'movie', 'film', 'music', 'song', 'album', 'artist', 'band',
+  'restaurant', 'food', 'recipe', 'restaurant', 'hotel', 'travel'
+];
+
 const FORAGER_SYSTEM_PROMPT = `You are Forager, an expert Web3 research analyst. A user wants to research a crypto project. Using the live web data provided, generate a comprehensive but concise research report structured exactly as follows:
 
 ## Project Overview
@@ -52,6 +71,35 @@ A one-paragraph balanced summary. End with a score from 1 to 10 for research con
 
 Always be honest. Never shill. Flag missing information clearly.`;
 
+function isCryptoProject(searchResults: SearchResult[]): boolean {
+  if (!searchResults || searchResults.length === 0) {
+    return false;
+  }
+
+  const allText = searchResults
+    .map((r) => `${r.title} ${r.snippet}`)
+    .join(' ')
+    .toLowerCase();
+
+  // Check for exclusion keywords first (football, sports, entertainment)
+  const excludedCount = EXCLUDED_KEYWORDS.filter(keyword =>
+    allText.includes(keyword.toLowerCase())
+  ).length;
+
+  // If many excluded keywords found, likely not a crypto project
+  if (excludedCount >= 3) {
+    return false;
+  }
+
+  // Check for required crypto keywords
+  const cryptoKeywordCount = CRYPTO_KEYWORDS.filter(keyword =>
+    allText.includes(keyword.toLowerCase())
+  ).length;
+
+  // Must have at least 2 crypto-related terms to be considered valid
+  return cryptoKeywordCount >= 2;
+}
+
 async function searchProject(projectName: string): Promise<SearchResult[]> {
   const serperApiKey = Deno.env.get('SERPER_API_KEY');
   if (!serperApiKey) {
@@ -65,7 +113,7 @@ async function searchProject(projectName: string): Promise<SearchResult[]> {
       'X-API-KEY': serperApiKey,
     },
     body: JSON.stringify({
-      q: `${projectName} crypto project tokenomics team audit news`,
+      q: `${projectName} crypto token blockchain`,
       num: 5,
     }),
   });
@@ -204,7 +252,15 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // Step 2: Stream AI-generated report
+    // Step 2: Validate this is actually a crypto project
+    if (!isCryptoProject(searchResults)) {
+      return new Response(
+        JSON.stringify({ error: `"${projectName}" does not appear to be a cryptocurrency or blockchain project. Forager only researches crypto projects, tokens, DeFi protocols, and Web3 applications.` }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // Step 3: Stream AI-generated report
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
