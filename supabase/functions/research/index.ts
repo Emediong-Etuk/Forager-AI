@@ -16,6 +16,13 @@ interface SerperResponse {
   organic: SearchResult[];
 }
 
+interface GroqChatResponse {
+  choices: {
+    message: { content: string };
+    finish_reason: string;
+  }[];
+}
+
 interface GroqStreamResponse {
   choices: {
     delta: { content?: string };
@@ -26,25 +33,6 @@ interface GroqStreamResponse {
 interface ResearchRequest {
   projectName: string;
 }
-
-const CRYPTO_KEYWORDS = [
-  'token', 'blockchain', 'deFi', 'nft', 'cryptocurrency', 'crypto',
-  'coin', 'smart contract', 'web3', 'dao', 'dex', 'yield', 'staking',
-  'protocol', 'layer 1', 'layer 2', 'l1', 'l2', 'swap', 'liquidity',
-  'governance', 'wallet', 'defi', 'meme coin', 'altcoin', 'btc', 'eth',
-  'satoshi', 'vitalik', 'whitepaper', 'presale', 'ico', 'airdrop',
-  'mainnet', 'testnet', 'consensus', 'validator', 'nodes'
-];
-
-const EXCLUDED_KEYWORDS = [
-  'football', 'soccer', 'player', 'club', 'team', 'match',
-  'basketball', 'tennis', 'athlete', 'sport', 'coach', 'striker',
-  'goalkeeper', 'midfielder', 'defender', 'world cup', 'champions league',
-  'premier league', 'la liga', 'serie a', 'league 1', 'bundesliga',
-  'country', 'nation', 'president', 'politician', 'actor', 'actress',
-  'movie', 'film', 'music', 'song', 'album', 'artist', 'band',
-  'restaurant', 'food', 'recipe', 'restaurant', 'hotel', 'travel'
-];
 
 const FORAGER_SYSTEM_PROMPT = `You are Forager, an expert Web3 research analyst. A user wants to research a crypto project. Using the live web data provided, generate a comprehensive but concise research report structured exactly as follows:
 
@@ -71,33 +59,73 @@ A one-paragraph balanced summary. End with a score from 1 to 10 for research con
 
 Always be honest. Never shill. Flag missing information clearly.`;
 
-function isCryptoProject(searchResults: SearchResult[]): boolean {
-  if (!searchResults || searchResults.length === 0) {
-    return false;
+async function groqChat(messages: { role: string; content: string }[], maxTokens = 200): Promise<string> {
+  const groqApiKey = Deno.env.get('GROQ_API_KEY');
+  if (!groqApiKey) {
+    throw new Error('GROQ_API_KEY not configured');
   }
 
-  const allText = searchResults
-    .map((r) => `${r.title} ${r.snippet}`)
-    .join(' ')
-    .toLowerCase();
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${groqApiKey}`,
+    },
+    body: JSON.stringify({
+      model: 'llama-3.3-70b-versatile',
+      max_tokens: maxTokens,
+      messages,
+      stream: false,
+    }),
+  });
 
-  // Check for exclusion keywords first (football, sports, entertainment)
-  const excludedCount = EXCLUDED_KEYWORDS.filter(keyword =>
-    allText.includes(keyword.toLowerCase())
-  ).length;
-
-  // If many excluded keywords found, likely not a crypto project
-  if (excludedCount >= 3) {
-    return false;
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Groq API failed: ${response.status} - ${errorText}`);
   }
 
-  // Check for required crypto keywords
-  const cryptoKeywordCount = CRYPTO_KEYWORDS.filter(keyword =>
-    allText.includes(keyword.toLowerCase())
-  ).length;
+  const data: GroqChatResponse = await response.json();
+  return data.choices?.[0]?.message?.content?.trim() ?? '';
+}
 
-  // Must have at least 2 crypto-related terms to be considered valid
-  return cryptoKeywordCount >= 2;
+async function validateCryptoProject(projectName: string): Promise<{ valid: boolean; reason: string }> {
+  const prompt = `Is "${projectName}" primarily known as a cryptocurrency, blockchain protocol, DeFi application, NFT collection, or Web3 project?
+
+Rules:
+- If it is PRIMARILY famous as a real person (athlete, celebrity, politician, etc.), answer false.
+- If it is PRIMARILY a country, city, or geographic region, answer false.
+- If it is PRIMARILY a sports team, brand, or non-crypto company, answer false.
+- If a meme coin was named after a famous person/place but the search term itself is that person/place (e.g. "Ronaldo", "Messi", "Argentina"), answer false — the user is searching for the person, not the coin.
+- Only answer true if the term is primarily and genuinely known in the crypto/Web3 space as a project.
+
+Examples:
+- "Ethereum" → true
+- "Bitcoin" → true
+- "Uniswap" → true
+- "Ronaldo" → false (football player)
+- "Cristiano Ronaldo" → false (football player)
+- "Messi" → false (football player)
+- "Argentina" → false (country)
+- "Madonna" → false (pop artist)
+- "Elon Musk" → false (person)
+- "Dogecoin" → true (crypto project, not just a meme)
+- "Shiba Inu" → true (established crypto project)
+
+Respond ONLY with valid JSON: {"valid": true/false, "reason": "one sentence explanation"}`;
+
+  const raw = await groqChat([{ role: 'user', content: prompt }], 150);
+
+  try {
+    // Extract JSON even if wrapped in markdown code fences
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON found');
+    const parsed = JSON.parse(jsonMatch[0]);
+    return { valid: Boolean(parsed.valid), reason: String(parsed.reason ?? '') };
+  } catch {
+    // If parsing fails, fall back to text matching
+    const lower = raw.toLowerCase();
+    return { valid: lower.includes('"valid": true') || lower.startsWith('true'), reason: raw };
+  }
 }
 
 async function searchProject(projectName: string): Promise<SearchResult[]> {
@@ -210,7 +238,6 @@ Generate a comprehensive research report for this project.`;
 }
 
 Deno.serve(async (req: Request) => {
-  // Handle CORS preflight
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
   }
@@ -226,17 +253,40 @@ Deno.serve(async (req: Request) => {
     const body: ResearchRequest = await req.json();
     const { projectName } = body;
 
-    if (!projectName || typeof projectName !== 'string') {
+    if (!projectName || typeof projectName !== 'string' || projectName.trim().length === 0) {
       return new Response(
         JSON.stringify({ error: "Project name is required" }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
-    // Step 1: Search for project information
+    const trimmed = projectName.trim();
+
+    // Step 1: Use LLM to validate this is a genuine crypto project
+    let validation: { valid: boolean; reason: string };
+    try {
+      validation = await validateCryptoProject(trimmed);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Validation failed';
+      return new Response(
+        JSON.stringify({ error: `Validation failed: ${message}` }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (!validation.valid) {
+      return new Response(
+        JSON.stringify({
+          error: `"${trimmed}" is not a cryptocurrency or blockchain project. Forager only researches crypto projects, tokens, DeFi protocols, and Web3 applications.`,
+        }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // Step 2: Search for project information
     let searchResults: SearchResult[];
     try {
-      searchResults = await searchProject(projectName.trim());
+      searchResults = await searchProject(trimmed);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Search failed';
       return new Response(
@@ -252,20 +302,12 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // Step 2: Validate this is actually a crypto project
-    if (!isCryptoProject(searchResults)) {
-      return new Response(
-        JSON.stringify({ error: `"${projectName}" does not appear to be a cryptocurrency or blockchain project. Forager only researches crypto projects, tokens, DeFi protocols, and Web3 applications.` }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
     // Step 3: Stream AI-generated report
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
         try {
-          await generateReportStream(projectName.trim(), searchResults, (chunk) => {
+          await generateReportStream(trimmed, searchResults, (chunk) => {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`));
           });
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));
